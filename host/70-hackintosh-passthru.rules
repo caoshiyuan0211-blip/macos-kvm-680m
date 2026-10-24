@@ -1,0 +1,13 @@
+# hackintosh-kvm: let the logged-in user's QEMU read keyboards/mice (input-linux evdev)
+# and take over the AX210 Bluetooth USB device (usb-host passthrough).
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}=="1", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_MOUSE}=="1", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="8087", ATTR{idProduct}=="0032", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_TOUCHPAD}=="1", TAG+="uaccess"
+# macOS-only machine: QEMU usb-host takes every other USB device too (scripts/usb-to-guest.sh); hubs stay
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{bDeviceClass}!="09", TAG+="uaccess"
+# ACPI Video Bus (Fn brightness keys) -> guest brightness via input-linux
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Video Bus", TAG+="uaccess"
+# Goodix touchscreen + stylus -> guest absolute pointer (input-linux touchscreen=on -> usb-tablet)
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_TOUCHSCREEN}=="1", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_TABLET}=="1", TAG+="uaccess"

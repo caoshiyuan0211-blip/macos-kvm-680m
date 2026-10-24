@@ -1,0 +1,925 @@
+diff --git a/hw/input/hid.c b/hw/input/hid.c
+index 0f28827..6db840c 100644
+--- a/hw/input/hid.c
++++ b/hw/input/hid.c
+@@ -49,7 +49,7 @@ static const uint8_t hid_usage_keys[0x100] = {
+     0x3f, 0x40, 0x41, 0x42, 0x43, 0x53, 0x47, 0x5f,
+     0x60, 0x61, 0x56, 0x5c, 0x5d, 0x5e, 0x57, 0x59,
+     0x5a, 0x5b, 0x62, 0x63, 0x46, 0x00, 0x64, 0x44,
+-    0x45, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e,
++    0x45, 0x68, 0x69, 0x6a, 0x6b, 0x68, 0x69, 0x6a, /* qnum 0x5d-0x5f = F13-F15 */
+     0xe8, 0xe9, 0x71, 0x72, 0x73, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x00, 0x85, 0x00, 0x00, 0x00, 0x00,
+     0x88, 0x00, 0x00, 0x87, 0x00, 0x00, 0x00, 0x00,
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index 23265f6..5f27231 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -1,4 +1,5 @@
+ system_ss.add(when: 'CONFIG_APPLESMC', if_true: files('applesmc.c'))
++system_ss.add(when: 'CONFIG_APPLESMC', if_true: files('host-battery.c'))
+ system_ss.add(when: 'CONFIG_EDU', if_true: files('edu.c'))
+ system_ss.add(when: 'CONFIG_FW_CFG_DMA', if_true: files('vmcoreinfo.c'))
+ system_ss.add(when: 'CONFIG_ISA_DEBUG', if_true: files('debugexit.c'))
+diff --git a/hw/net/vmxnet3.c b/hw/net/vmxnet3.c
+index 24c551a..0a59fc6 100644
+--- a/hw/net/vmxnet3.c
++++ b/hw/net/vmxnet3.c
+@@ -2275,6 +2275,19 @@ static void vmxnet3_qdev_reset(DeviceState *dev)
+     vmxnet3_reset(s);
+ }
+ 
++/*
++ * S3 wakeup: keep the device state. The macOS vmxnet3 driver (written for
++ * VMware, which keeps virtual NIC state across S3) never re-activates the
++ * device after resume, so a wakeup reset leaves RX dead.
++ */
++static void vmxnet3_reset_hold(Object *obj, ResetType type)
++{
++    if (type == RESET_TYPE_WAKEUP) {
++        return;
++    }
++    vmxnet3_qdev_reset(DEVICE(obj));
++}
++
+ static bool vmxnet3_mc_list_needed(void *opaque)
+ {
+     return true;
+@@ -2493,7 +2506,8 @@ static void vmxnet3_class_init(ObjectClass *class, const void *data)
+     c->subsystem_vendor_id = PCI_VENDOR_ID_VMWARE;
+     c->subsystem_id = PCI_DEVICE_ID_VMWARE_VMXNET3;
+     dc->desc = "VMWare Paravirtualized Ethernet v3";
+-    device_class_set_legacy_reset(dc, vmxnet3_qdev_reset);
++    ResettableClass *rc = RESETTABLE_CLASS(class);
++    rc->phases.hold = vmxnet3_reset_hold;
+     dc->vmsd = &vmstate_vmxnet3;
+     device_class_set_props(dc, vmxnet3_properties);
+     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
+diff --git a/hw/vfio/pci.c b/hw/vfio/pci.c
+index 428ab2f..a612b20 100644
+--- a/hw/vfio/pci.c
++++ b/hw/vfio/pci.c
+@@ -1457,6 +1457,38 @@ void vfio_pci_write_config(PCIDevice *pdev,
+ 
+     trace_vfio_pci_write_config(vdev->vbasedev.name, addr, val, len);
+ 
++    /*
++     * RMB_KEEP_CMD=<host bdf>: never let the guest clear MEM/BUS_MASTER on the
++     * physical device (macOS does early in boot; the 680M boot scanout then stalls).
++     * The emulated config space still sees the guest's value.
++     */
++    /*
++     * RMB_KEEP_CMD device: log every guest config write with wall-clock ms, to line up
++     * with the boot-logo timeline (logs/dcn-timeline-*.txt).
++     */
++    {
++        const char *keep = getenv("RMB_KEEP_CMD");
++        if (keep && !strcmp(keep, vbasedev->name)) {
++            struct timespec ts;
++            clock_gettime(CLOCK_REALTIME, &ts);
++            fprintf(stderr, "rmb: %ld.%03ld %s cfg write addr 0x%x len %d val 0x%x\n",
++                    (long)ts.tv_sec, ts.tv_nsec / 1000000, vbasedev->name, addr, len, val);
++        }
++    }
++    if (range_covers_byte(addr, len, PCI_COMMAND)) {
++        const char *keep = getenv("RMB_KEEP_CMD");
++        uint32_t shift = (PCI_COMMAND - addr) * 8;
++        uint32_t bits = (uint32_t)(PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER) << shift;
++
++        fprintf(stderr, "rmb: %s guest COMMAND write 0x%x (addr 0x%x len %d)\n",
++                vbasedev->name, (val >> shift) & 0xffff, addr, len);
++        if (keep && !strcmp(keep, vbasedev->name) && (val & bits) != bits) {
++            fprintf(stderr, "rmb: %s keeping MEM|BUS_MASTER set on hardware\n",
++                    vbasedev->name);
++            val_le = cpu_to_le32(val | bits);
++        }
++    }
++
+     /* Write everything to VFIO, let it filter out what we can't write */
+     ret = vfio_pci_config_space_write(vdev, addr, len, &val_le);
+     if (ret != len) {
+diff --git a/qapi/qom.json b/qapi/qom.json
+index c55776a..f64ed88 100644
+--- a/qapi/qom.json
++++ b/qapi/qom.json
+@@ -558,13 +558,33 @@
+ # @grab-toggle: the key or key combination that toggles device grab
+ #     (default: ctrl-ctrl)
+ #
++# @touchpad: translate absolute touchpad events into a relative mouse
++#     (default: false)
++#
++# @toggle: if false, the grab-toggle hotkey is ignored (default: true)
++#
++# @touchscreen: id of the display device whose console the guest's
++#     usb-tablet is bound to; absolute touchscreen/stylus events go
++#     there, touch = left button (default: none)
++#
++# @touchrot: clockwise rotation in degrees (0, 90, 180, 270) from the
++#     touchscreen digitizer axes to the screen axes (default: 0)
++#
++# @mute-ms: drop all input-linux input to the guest (every device)
++#     for this many milliseconds from now; 0 unmutes (default: 0)
++#
+ # Since: 2.6
+ ##
+ { 'struct': 'InputLinuxProperties',
+   'data': { 'evdev': 'str',
+             '*grab_all': 'bool',
+             '*repeat': 'bool',
+-            '*grab-toggle': 'GrabToggleKeys' },
++            '*grab-toggle': 'GrabToggleKeys',
++            '*touchpad': 'bool',
++            '*toggle': 'bool',
++            '*touchscreen': 'str',
++            '*touchrot': 'uint32',
++            '*mute-ms': 'uint32' },
+   'if': 'CONFIG_LINUX' }
+ 
+ ##
+diff --git a/ui/input-linux.c b/ui/input-linux.c
+index f4eee1f..67e4d1e 100644
+--- a/ui/input-linux.c
++++ b/ui/input-linux.c
+@@ -5,14 +5,19 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qapi/visitor.h"
+ #include "qapi/error.h"
+ #include "qemu/config-file.h"
+ #include "qemu/main-loop.h"
+ #include "qemu/module.h"
+ #include "qemu/sockets.h"
++#include "qemu/timer.h"
+ #include "ui/input.h"
++#include "ui/console.h"
+ #include "qom/object_interfaces.h"
+ #include "system/iothread.h"
++#include "system/runstate.h"
++#include "qemu/error-report.h"
+ 
+ #include <sys/ioctl.h>
+ #include "standard-headers/linux/input.h"
+@@ -30,6 +35,20 @@ static bool linux_is_button(unsigned int lnx)
+ }
+ 
+ #define TYPE_INPUT_LINUX "input-linux"
++
++/*
++ * rmb: guest sleep entry takes ~40 s here and any HID event in that window
++ * aborts it ("full wake due to dark wake activity tickle"). qom-set mute-ms on
++ * any input-linux object drops all input to the guest (every device) until
++ * the deadline; the escape hotkey still works. 0 unmutes.
++ */
++static int64_t input_linux_mute_until;
++
++static bool input_linux_muted(void)
++{
++    return input_linux_mute_until &&
++           qemu_clock_get_ms(QEMU_CLOCK_REALTIME) < input_linux_mute_until;
++}
+ OBJECT_DECLARE_SIMPLE_TYPE(InputLinux,
+                            INPUT_LINUX)
+ 
+@@ -59,7 +78,30 @@ struct InputLinux {
+     struct input_event event;
+     int         read_offset;
+ 
++    /* rmb: touchpad=on turns absolute touchpad events into a relative mouse */
++    bool        touchpad;
++    int         tp_res;          /* units per mm (ABS_X resolution) */
++    int         tp_x, tp_y;      /* latest ABS_X/ABS_Y */
++    int         tp_px, tp_py;    /* position at the previous SYN */
++    bool        tp_valid;        /* tp_px/py usable for a delta */
++    bool        tp_touch, tp_two, tp_click;
++    bool        tp_was_two;      /* 2 fingers seen during this touch */
++    int64_t     tp_down_ms;
++    int         tp_travel;       /* |dx|+|dy| during this touch */
++    int         tp_scroll;
++    int         tp_fx, tp_fy;    /* sub-mickey remainders (x256) */
++
++    /* rmb: touchscreen=<display id>: absolute events to the usb-tablet bound to that console */
++    char        *touchscreen;
++    QemuConsole *ts_con;
++    uint32_t    ts_rot;          /* touchrot=0/90/180/270: digitizer -> screen rotation */
++    int         ts_x, ts_y;      /* latest raw ABS_X/ABS_Y */
++    bool        ts_moved;        /* position changed since the last SYN */
++    int         ts_btn;          /* touch-down held back until the position is out (-1 none) */
++
+     enum GrabToggleKeys grab_toggle;
++    bool        toggle;          /* rmb: toggle=off disables the grab hotkey */
++    QEMUTimer   *escape_timer;   /* rmb: toggle=off: hold LCtrl+RCtrl -> quit QEMU */
+ 
+     QTAILQ_ENTRY(InputLinux) next;
+ };
+@@ -67,34 +109,34 @@ struct InputLinux {
+ 
+ static QTAILQ_HEAD(, InputLinux) inputs = QTAILQ_HEAD_INITIALIZER(inputs);
+ 
+-static void input_linux_toggle_grab(InputLinux *il)
++static void input_linux_set_grab(InputLinux *il, bool on)
+ {
+-    intptr_t request = !il->grab_active;
+-    InputLinux *item;
+-    int rc;
+-
+-    rc = ioctl(il->fd, EVIOCGRAB, request);
+-    if (rc < 0) {
++    if (il->grab_active == on || ioctl(il->fd, EVIOCGRAB, (intptr_t)on) < 0) {
+         return;
+     }
+-    il->grab_active = !il->grab_active;
++    il->grab_active = on;
++}
+ 
+-    if (!il->grab_all) {
+-        return;
+-    }
++/*
++ * rmb: the toggle hotkey on any device switches every input-linux device
++ * (upstream only follows grab_all on the device the hotkey was pressed on).
++ */
++static void input_linux_toggle_grab(InputLinux *il)
++{
++    bool on = !il->grab_active;
++    InputLinux *item;
++
++    input_linux_set_grab(il, on);
+     QTAILQ_FOREACH(item, &inputs, next) {
+-        if (item == il || item->grab_all) {
+-            /* avoid endless loops */
+-            continue;
+-        }
+-        if (item->grab_active != il->grab_active) {
+-            input_linux_toggle_grab(item);
+-        }
++        input_linux_set_grab(item, il->grab_active);
+     }
+ }
+ 
+ static bool input_linux_check_toggle(InputLinux *il)
+ {
++    if (!il->toggle) {
++        return false;
++    }
+     switch (il->grab_toggle) {
+     case GRAB_TOGGLE_KEYS_CTRL_CTRL:
+         return il->keydown[KEY_LEFTCTRL] &&
+@@ -127,6 +169,36 @@ static bool input_linux_check_toggle(InputLinux *il)
+     return false;
+ }
+ 
++/*
++ * rmb: with toggle=off a hung guest would keep every keyboard/mouse (and the passed-through
++ * Wi-Fi) away from the host. Holding LCtrl+RCtrl for ESCAPE_HOLD_MS quits QEMU instead.
++ */
++#define ESCAPE_HOLD_MS 2000
++
++static void input_linux_escape(void *opaque)
++{
++    error_report("input-linux: LCtrl+RCtrl held %d ms -> quitting", ESCAPE_HOLD_MS);
++    qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
++}
++
++static void input_linux_check_escape(InputLinux *il)
++{
++    if (il->toggle) {
++        return;
++    }
++    if (il->keydown[KEY_LEFTCTRL] && il->keydown[KEY_RIGHTCTRL]) {
++        if (!il->escape_timer) {
++            il->escape_timer = timer_new_ms(QEMU_CLOCK_REALTIME, input_linux_escape, il);
++        }
++        if (!timer_pending(il->escape_timer)) {
++            timer_mod(il->escape_timer,
++                      qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + ESCAPE_HOLD_MS);
++        }
++    } else if (il->escape_timer) {
++        timer_del(il->escape_timer);
++    }
++}
++
+ static bool input_linux_should_skip(InputLinux *il,
+                                     struct input_event *event)
+ {
+@@ -163,10 +235,26 @@ static void input_linux_handle_keyboard(InputLinux *il,
+             il->keydown[event->code] = false;
+             il->keycount--;
+         }
++        input_linux_check_escape(il);
+ 
+         /* send event to guest when grab is active */
+-        if (il->grab_active && !input_linux_should_skip(il, event)) {
+-            qemu_input_event_send_key_linux(NULL, event->code, event->value);
++        if (il->grab_active && !input_linux_muted() &&
++            !input_linux_should_skip(il, event)) {
++            /*
++             * Brightness keys (ACPI Video Bus) have no qcode; macOS takes
++             * F14/F15 as brightness down/up on non-Apple keyboards.
++             */
++            unsigned int code = event->code;
++            if (code == KEY_BRIGHTNESSDOWN) {
++                code = KEY_F14;
++            } else if (code == KEY_BRIGHTNESSUP) {
++                code = KEY_F15;
++            }
++            if (code != event->code) {
++                fprintf(stderr, "input-linux: brightness key %d value %d -> F%d\n",
++                        event->code, event->value, code == KEY_F14 ? 14 : 15);
++            }
++            qemu_input_event_send_key_linux(NULL, code, event->value);
+         }
+ 
+         /* hotkey -> record switch request ... */
+@@ -194,46 +282,196 @@ static void input_linux_event_mouse_button(int button)
+     qemu_input_event_sync();
+ }
+ 
++/*
++ * rmb: touchpad -> relative mouse. One finger moves, two fingers scroll,
++ * a short tap clicks (two-finger tap / two-finger press = right click).
++ */
++static void input_linux_handle_touchpad(InputLinux *il,
++                                        struct input_event *event)
++{
++    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++    int res = il->tp_res > 0 ? il->tp_res : 12;
++
++    switch (event->type) {
++    case EV_KEY:
++        switch (event->code) {
++        case BTN_TOUCH:
++            il->tp_touch = event->value;
++            il->tp_valid = false;
++            if (event->value) {
++                il->tp_down_ms = now;
++                il->tp_travel = 0;
++                il->tp_was_two = false;
++                il->tp_scroll = 0;
++            } else if (il->grab_active && !input_linux_muted() && !il->tp_click &&
++                       now - il->tp_down_ms < 200 && il->tp_travel < 2 * res) {
++                input_linux_event_mouse_button(il->tp_was_two
++                                               ? INPUT_BUTTON_RIGHT
++                                               : INPUT_BUTTON_LEFT);
++            }
++            break;
++        case BTN_TOOL_DOUBLETAP:
++            il->tp_two = event->value;
++            il->tp_was_two |= event->value;
++            il->tp_valid = false;
++            break;
++        case BTN_LEFT:
++            il->tp_click = event->value;
++            il->tp_travel += 4 * res;   /* a press is never a tap */
++            if (il->grab_active && !input_linux_muted()) {
++                qemu_input_queue_btn(NULL, il->tp_two ? INPUT_BUTTON_RIGHT
++                                                      : INPUT_BUTTON_LEFT,
++                                     event->value);
++                qemu_input_event_sync();
++            }
++            break;
++        }
++        break;
++    case EV_ABS:
++        if (event->code == ABS_X) {
++            il->tp_x = event->value;
++        } else if (event->code == ABS_Y) {
++            il->tp_y = event->value;
++        }
++        break;
++    case EV_SYN:
++        if (!il->tp_touch) {
++            break;
++        }
++        if (il->tp_valid && il->grab_active && !input_linux_muted()) {
++            int dx = il->tp_x - il->tp_px, dy = il->tp_y - il->tp_py;
++            il->tp_travel += abs(dx) + abs(dy);
++            if (il->tp_two) {
++                /* natural scrolling: one wheel step per 2 mm */
++                il->tp_scroll += dy;
++                while (il->tp_scroll >= 2 * res) {
++                    input_linux_event_mouse_button(INPUT_BUTTON_WHEEL_UP);
++                    il->tp_scroll -= 2 * res;
++                }
++                while (il->tp_scroll <= -2 * res) {
++                    input_linux_event_mouse_button(INPUT_BUTTON_WHEEL_DOWN);
++                    il->tp_scroll += 2 * res;
++                }
++            } else {
++                /* ~10 mickeys per mm, fixed point x256 */
++                int mx = dx * 2560 / res + il->tp_fx;
++                int my = dy * 2560 / res + il->tp_fy;
++                il->tp_fx = mx % 256;
++                il->tp_fy = my % 256;
++                if (mx / 256 || my / 256) {
++                    qemu_input_queue_rel(NULL, INPUT_AXIS_X, mx / 256);
++                    qemu_input_queue_rel(NULL, INPUT_AXIS_Y, my / 256);
++                    qemu_input_event_sync();
++                }
++            }
++        }
++        il->tp_px = il->tp_x;
++        il->tp_py = il->tp_y;
++        il->tp_valid = true;
++        break;
++    }
++}
++
++/*
++ * rmb: touchscreen position with touchrot applied. touchrot is the clockwise
++ * angle from the digitizer axes to the screen axes (GPD: portrait digitizer
++ * 6400x10240 under a landscape 2560x1600 panel).
++ */
++static void input_linux_touch_pos(InputLinux *il, QemuConsole *src)
++{
++    int xr = il->abs_x_max - il->abs_x_min, yr = il->abs_y_max - il->abs_y_min;
++    int x = il->ts_x - il->abs_x_min, y = il->ts_y - il->abs_y_min;
++
++    switch (il->ts_rot) {
++    case 90:
++        qemu_input_queue_abs(src, INPUT_AXIS_X, yr - y, 0, yr);
++        qemu_input_queue_abs(src, INPUT_AXIS_Y, x, 0, xr);
++        break;
++    case 180:
++        qemu_input_queue_abs(src, INPUT_AXIS_X, xr - x, 0, xr);
++        qemu_input_queue_abs(src, INPUT_AXIS_Y, yr - y, 0, yr);
++        break;
++    case 270:
++        qemu_input_queue_abs(src, INPUT_AXIS_X, y, 0, yr);
++        qemu_input_queue_abs(src, INPUT_AXIS_Y, xr - x, 0, xr);
++        break;
++    default:
++        qemu_input_queue_abs(src, INPUT_AXIS_X, x, 0, xr);
++        qemu_input_queue_abs(src, INPUT_AXIS_Y, y, 0, yr);
++        break;
++    }
++}
++
+ static void input_linux_handle_mouse(InputLinux *il, struct input_event *event)
+ {
+-    if (!il->grab_active) {
++    if (il->touchpad) {
++        input_linux_handle_touchpad(il, event);
+         return;
+     }
++    QemuConsole *src = NULL;
++
++    if (!il->grab_active || input_linux_muted()) {
++        return;
++    }
++    if (il->touchscreen) {
++        /* -object is created before the display device: look the console up lazily */
++        if (!il->ts_con) {
++            il->ts_con = qemu_console_lookup_by_device_name(il->touchscreen,
++                                                            0, NULL);
++        }
++        if (!il->ts_con) {
++            return;
++        }
++        src = il->ts_con;
++    }
+ 
+     switch (event->type) {
+     case EV_KEY:
+         switch (event->code) {
+         case BTN_LEFT:
+-            qemu_input_queue_btn(NULL, INPUT_BUTTON_LEFT, event->value);
++            qemu_input_queue_btn(src, INPUT_BUTTON_LEFT, event->value);
+             break;
+         case BTN_RIGHT:
+-            qemu_input_queue_btn(NULL, INPUT_BUTTON_RIGHT, event->value);
++            qemu_input_queue_btn(src, INPUT_BUTTON_RIGHT, event->value);
+             break;
+         case BTN_MIDDLE:
+-            qemu_input_queue_btn(NULL, INPUT_BUTTON_MIDDLE, event->value);
++            qemu_input_queue_btn(src, INPUT_BUTTON_MIDDLE, event->value);
+             break;
+         case BTN_GEAR_UP:
+-            qemu_input_queue_btn(NULL, INPUT_BUTTON_WHEEL_UP, event->value);
++            qemu_input_queue_btn(src, INPUT_BUTTON_WHEEL_UP, event->value);
+             break;
+         case BTN_GEAR_DOWN:
+-            qemu_input_queue_btn(NULL, INPUT_BUTTON_WHEEL_DOWN,
++            qemu_input_queue_btn(src, INPUT_BUTTON_WHEEL_DOWN,
+                                  event->value);
+             break;
+         case BTN_SIDE:
+-            qemu_input_queue_btn(NULL, INPUT_BUTTON_SIDE, event->value);
++            qemu_input_queue_btn(src, INPUT_BUTTON_SIDE, event->value);
+             break;
+         case BTN_EXTRA:
+-            qemu_input_queue_btn(NULL, INPUT_BUTTON_EXTRA, event->value);
++            qemu_input_queue_btn(src, INPUT_BUTTON_EXTRA, event->value);
++            break;
++        case BTN_TOUCH:     /* finger / pen tip */
++            if (src && event->value) {
++                il->ts_btn = 1; /* press after the new position (EV_SYN) */
++            } else if (src) {
++                il->ts_btn = -1;
++                qemu_input_queue_btn(src, INPUT_BUTTON_LEFT, 0);
++            }
++            break;
++        case BTN_STYLUS:    /* pen barrel button */
++            if (src) {
++                qemu_input_queue_btn(src, INPUT_BUTTON_RIGHT, event->value);
++            }
+             break;
+         };
+         break;
+     case EV_REL:
+         switch (event->code) {
+         case REL_X:
+-            qemu_input_queue_rel(NULL, INPUT_AXIS_X, event->value);
++            qemu_input_queue_rel(src, INPUT_AXIS_X, event->value);
+             break;
+         case REL_Y:
+-            qemu_input_queue_rel(NULL, INPUT_AXIS_Y, event->value);
++            qemu_input_queue_rel(src, INPUT_AXIS_Y, event->value);
+             break;
+         case REL_WHEEL:
+             il->wheel = event->value;
+@@ -241,19 +479,40 @@ static void input_linux_handle_mouse(InputLinux *il, struct input_event *event)
+         }
+         break;
+     case EV_ABS:
++        if (src) {
++            /* touchscreen: rotate at EV_SYN, the digitizer may be mounted turned */
++            if (event->code == ABS_X) {
++                il->ts_x = event->value;
++                il->ts_moved = true;
++            } else if (event->code == ABS_Y) {
++                il->ts_y = event->value;
++                il->ts_moved = true;
++            }
++            break;
++        }
+         switch (event->code) {
+         case ABS_X:
+-            qemu_input_queue_abs(NULL, INPUT_AXIS_X, event->value,
++            qemu_input_queue_abs(src, INPUT_AXIS_X, event->value,
+                                  il->abs_x_min, il->abs_x_max);
+             break;
+         case ABS_Y:
+-            qemu_input_queue_abs(NULL, INPUT_AXIS_Y, event->value,
++            qemu_input_queue_abs(src, INPUT_AXIS_Y, event->value,
+                                  il->abs_y_min, il->abs_y_max);
+             break;
+         }
+         break;
+     case EV_SYN:
++        if (src && il->ts_moved) {
++            input_linux_touch_pos(il, src);
++            il->ts_moved = false;
++        }
+         qemu_input_event_sync();
++        if (src && il->ts_btn == 1) {
++            /* separate report: the guest sees the pointer at the touch first */
++            qemu_input_queue_btn(src, INPUT_BUTTON_LEFT, 1);
++            qemu_input_event_sync();
++            il->ts_btn = -1;
++        }
+         if (il->wheel != 0) {
+             input_linux_event_mouse_button((il->wheel > 0)
+                                            ? INPUT_BUTTON_WHEEL_UP
+@@ -356,6 +615,7 @@ static void input_linux_complete(UserCreatable *uc, Error **errp)
+             }
+             il->abs_x_min = absinfo.minimum;
+             il->abs_x_max = absinfo.maximum;
++            il->tp_res = absinfo.resolution;
+             rc = ioctl(il->fd, EVIOCGABS(ABS_Y), &absinfo);
+             if (rc < 0) {
+                 error_setg(errp, "%s: failed to get get absolute Y value",
+@@ -420,7 +680,11 @@ static void input_linux_instance_finalize(Object *obj)
+         qemu_set_fd_handler(il->fd, NULL, NULL, NULL);
+         close(il->fd);
+     }
++    if (il->escape_timer) {
++        timer_free(il->escape_timer);
++    }
+     g_free(il->evdev);
++    g_free(il->touchscreen);
+ }
+ 
+ static char *input_linux_get_evdev(Object *obj, Error **errp)
+@@ -472,6 +736,76 @@ static void input_linux_set_repeat(Object *obj, bool value,
+     il->repeat = value;
+ }
+ 
++static bool input_linux_get_touchpad(Object *obj, Error **errp)
++{
++    InputLinux *il = INPUT_LINUX(obj);
++
++    return il->touchpad;
++}
++
++static void input_linux_set_touchpad(Object *obj, bool value,
++                                     Error **errp)
++{
++    InputLinux *il = INPUT_LINUX(obj);
++
++    il->touchpad = value;
++}
++
++static char *input_linux_get_touchscreen(Object *obj, Error **errp)
++{
++    InputLinux *il = INPUT_LINUX(obj);
++
++    return g_strdup(il->touchscreen);
++}
++
++static void input_linux_set_touchscreen(Object *obj, const char *value,
++                                        Error **errp)
++{
++    InputLinux *il = INPUT_LINUX(obj);
++
++    g_free(il->touchscreen);
++    il->touchscreen = g_strdup(value);
++}
++
++static void input_linux_get_touchrot(Object *obj, Visitor *v, const char *name,
++                                     void *opaque, Error **errp)
++{
++    InputLinux *il = INPUT_LINUX(obj);
++
++    visit_type_uint32(v, name, &il->ts_rot, errp);
++}
++
++static void input_linux_set_touchrot(Object *obj, Visitor *v, const char *name,
++                                     void *opaque, Error **errp)
++{
++    InputLinux *il = INPUT_LINUX(obj);
++    uint32_t rot;
++
++    if (!visit_type_uint32(v, name, &rot, errp)) {
++        return;
++    }
++    if (rot % 90 || rot > 270) {
++        error_setg(errp, "touchrot must be 0, 90, 180 or 270");
++        return;
++    }
++    il->ts_rot = rot;
++}
++
++static bool input_linux_get_toggle(Object *obj, Error **errp)
++{
++    InputLinux *il = INPUT_LINUX(obj);
++
++    return il->toggle;
++}
++
++static void input_linux_set_toggle(Object *obj, bool value,
++                                   Error **errp)
++{
++    InputLinux *il = INPUT_LINUX(obj);
++
++    il->toggle = value;
++}
++
+ static int input_linux_get_grab_toggle(Object *obj, Error **errp)
+ {
+     InputLinux *il = INPUT_LINUX(obj);
+@@ -487,8 +821,35 @@ static void input_linux_set_grab_toggle(Object *obj, int value,
+     il->grab_toggle = value;
+ }
+ 
++static void input_linux_get_mute_ms(Object *obj, Visitor *v, const char *name,
++                                    void *opaque, Error **errp)
++{
++    int64_t left = input_linux_mute_until -
++                   qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++    uint32_t value = left > 0 ? left : 0;
++
++    visit_type_uint32(v, name, &value, errp);
++}
++
++static void input_linux_set_mute_ms(Object *obj, Visitor *v, const char *name,
++                                    void *opaque, Error **errp)
++{
++    uint32_t value;
++
++    if (!visit_type_uint32(v, name, &value, errp)) {
++        return;
++    }
++    input_linux_mute_until = value ?
++        qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + value : 0;
++    fprintf(stderr, "input-linux: %s for %u ms\n",
++            value ? "input muted" : "input unmuted", value);
++}
++
+ static void input_linux_instance_init(Object *obj)
+ {
++    InputLinux *il = INPUT_LINUX(obj);
++
++    il->toggle = true;
+ }
+ 
+ static void input_linux_class_init(ObjectClass *oc, const void *data)
+@@ -506,6 +867,21 @@ static void input_linux_class_init(ObjectClass *oc, const void *data)
+     object_class_property_add_bool(oc, "repeat",
+                                    input_linux_get_repeat,
+                                    input_linux_set_repeat);
++    object_class_property_add_bool(oc, "touchpad",
++                                   input_linux_get_touchpad,
++                                   input_linux_set_touchpad);
++    object_class_property_add_str(oc, "touchscreen",
++                                  input_linux_get_touchscreen,
++                                  input_linux_set_touchscreen);
++    object_class_property_add(oc, "touchrot", "uint32",
++                              input_linux_get_touchrot,
++                              input_linux_set_touchrot, NULL, NULL);
++    object_class_property_add(oc, "mute-ms", "uint32",
++                              input_linux_get_mute_ms,
++                              input_linux_set_mute_ms, NULL, NULL);
++    object_class_property_add_bool(oc, "toggle",
++                                   input_linux_get_toggle,
++                                   input_linux_set_toggle);
+     object_class_property_add_enum(oc, "grab-toggle", "GrabToggleKeys",
+                                    &GrabToggleKeys_lookup,
+                                    input_linux_get_grab_toggle,
+diff --git a/hw/misc/host-battery.c b/hw/misc/host-battery.c
+new file mode 100644
+index 0000000..882231d
+--- /dev/null
++++ b/hw/misc/host-battery.c
+@@ -0,0 +1,180 @@
++/*
++ * host-battery: expose the host's /sys/class/power_supply battery + AC
++ * adapter to the guest as a block of read-only 32-bit I/O registers.
++ * A guest SSDT (hackintosh-kvm src/acpi/SSDT-HOSTBAT.dsl) reads them from
++ * _BIF/_BST/_PSR, so the guest sees the real laptop battery.
++ *
++ * Registers (dword, offset):
++ *   0x00 magic 'HBAT'     0x04 _BST state (1 discharging, 2 charging)
++ *   0x08 rate (mA|mW)     0x0c remaining (mAh|mWh)
++ *   0x10 voltage (mV)     0x14 design capacity
++ *   0x18 last full        0x1c design voltage (mV)
++ *   0x20 AC online        0x24 cycle count
++ *   0x28 power unit (0 mWh, 1 mAh)   0x2c present
++ *   0x30 capacity percent
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/isa/isa.h"
++#include "hw/core/qdev-properties.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "qom/object.h"
++
++#define TYPE_HOST_BATTERY "host-battery"
++OBJECT_DECLARE_SIMPLE_TYPE(HostBatteryState, HOST_BATTERY)
++
++#define HBAT_NREGS 13
++
++struct HostBatteryState {
++    ISADevice parent_obj;
++
++    uint32_t iobase;
++    char *bat;
++    char *ac;
++    MemoryRegion io;
++    uint32_t regs[HBAT_NREGS];
++    int64_t last_ms;
++};
++
++static bool read_sysfs(const char *dev, const char *attr, long long *val)
++{
++    g_autofree char *path = g_strdup_printf("/sys/class/power_supply/%s/%s",
++                                            dev, attr);
++    g_autofree char *buf = NULL;
++
++    if (!g_file_get_contents(path, &buf, NULL, NULL)) {
++        return false;
++    }
++    *val = strtoll(buf, NULL, 10);
++    return true;
++}
++
++static uint32_t sysfs_u32(const char *dev, const char *attr, long long div)
++{
++    long long v;
++
++    if (!read_sysfs(dev, attr, &v) || v < 0) {
++        return 0xffffffff;      /* ACPI "unknown" */
++    }
++    return v / div;
++}
++
++static void host_battery_refresh(HostBatteryState *s)
++{
++    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++    g_autofree char *status = NULL;
++    g_autofree char *path = NULL;
++    long long v;
++    bool energy;
++    uint32_t state = 0;
++
++    if (s->last_ms && now - s->last_ms < 1000) {
++        return;
++    }
++    s->last_ms = now;
++
++    energy = !read_sysfs(s->bat, "charge_full", &v);
++    s->regs[0] = 0x54414248;    /* 'HBAT' */
++    path = g_strdup_printf("/sys/class/power_supply/%s/status", s->bat);
++    if (g_file_get_contents(path, &status, NULL, NULL)) {
++        if (g_str_has_prefix(status, "Discharging")) {
++            state = 1;
++        } else if (g_str_has_prefix(status, "Charging")) {
++            state = 2;
++        }
++    }
++    s->regs[1] = state;
++    if (energy) {
++        s->regs[2] = sysfs_u32(s->bat, "power_now", 1000);
++        s->regs[3] = sysfs_u32(s->bat, "energy_now", 1000);
++        s->regs[5] = sysfs_u32(s->bat, "energy_full_design", 1000);
++        s->regs[6] = sysfs_u32(s->bat, "energy_full", 1000);
++    } else {
++        s->regs[2] = sysfs_u32(s->bat, "current_now", 1000);
++        s->regs[3] = sysfs_u32(s->bat, "charge_now", 1000);
++        s->regs[5] = sysfs_u32(s->bat, "charge_full_design", 1000);
++        s->regs[6] = sysfs_u32(s->bat, "charge_full", 1000);
++    }
++    s->regs[4] = sysfs_u32(s->bat, "voltage_now", 1000);
++    s->regs[7] = sysfs_u32(s->bat, "voltage_min_design", 1000);
++    s->regs[8] = read_sysfs(s->ac, "online", &v) ? !!v : 1;
++    s->regs[9] = sysfs_u32(s->bat, "cycle_count", 1);
++    s->regs[10] = energy ? 0 : 1;
++    s->regs[11] = read_sysfs(s->bat, "present", &v) ? !!v : 0;
++    s->regs[12] = sysfs_u32(s->bat, "capacity", 1);
++}
++
++static uint64_t host_battery_read(void *opaque, hwaddr addr, unsigned size)
++{
++    HostBatteryState *s = opaque;
++
++    if (addr / 4 >= HBAT_NREGS) {
++        return 0;
++    }
++    host_battery_refresh(s);
++    return s->regs[addr / 4] >> ((addr & 3) * 8);
++}
++
++static void host_battery_write(void *opaque, hwaddr addr, uint64_t val,
++                               unsigned width)
++{
++}
++
++static const MemoryRegionOps host_battery_ops = {
++    .read = host_battery_read,
++    .write = host_battery_write,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static void host_battery_realizefn(DeviceState *d, Error **errp)
++{
++    ISADevice *dev = ISA_DEVICE(d);
++    HostBatteryState *s = HOST_BATTERY(d);
++
++    if (!s->bat) {
++        s->bat = g_strdup("BAT0");
++    }
++    if (!s->ac) {
++        s->ac = g_strdup("ADP1");
++    }
++    memory_region_init_io(&s->io, OBJECT(dev), &host_battery_ops, s,
++                          TYPE_HOST_BATTERY, 0x40);
++    memory_region_add_subregion(isa_address_space_io(dev), s->iobase, &s->io);
++}
++
++static const Property host_battery_properties[] = {
++    DEFINE_PROP_UINT32("iobase", HostBatteryState, iobase, 0x530),
++    DEFINE_PROP_STRING("bat", HostBatteryState, bat),
++    DEFINE_PROP_STRING("ac", HostBatteryState, ac),
++};
++
++static void host_battery_class_initfn(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = host_battery_realizefn;
++    device_class_set_props(dc, host_battery_properties);
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++}
++
++static const TypeInfo host_battery_info = {
++    .name          = TYPE_HOST_BATTERY,
++    .parent        = TYPE_ISA_DEVICE,
++    .instance_size = sizeof(HostBatteryState),
++    .class_init    = host_battery_class_initfn,
++};
++
++static void host_battery_register_types(void)
++{
++    type_register_static(&host_battery_info);
++}
++
++type_init(host_battery_register_types)

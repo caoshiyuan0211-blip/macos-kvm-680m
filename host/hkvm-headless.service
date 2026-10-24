@@ -1,0 +1,17 @@
+# hackintosh-kvm: boot without the USB4 RTX 5070 Ti dock -> start the tty1 autologin that runs the VM
+# (getty@tty1.service.d/hkvm-headless.conf + ~/.bash_profile). getty@tty1 can't be pulled in by
+# getty.target: sddm.service has Conflicts=getty@tty1.service, so the getty job is dropped from the
+# boot transaction even though sddm is then skipped by its ExecCondition (boot 2026-10-20 16:29).
+# Starting it from a separate job after sddm was skipped avoids that.
+# Install: sudo install -m644 host/hkvm-headless.service /etc/systemd/system/ && sudo systemctl enable hkvm-headless.service
+[Unit]
+Description=Start tty1 autologin for the headless macOS VM (no NVIDIA eGPU)
+After=sddm.service systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+ExecCondition=/bin/sh -c '! lspci -n -d 10de: | grep -q .'
+ExecStart=/usr/bin/systemctl start --no-block getty@tty1.service
+
+[Install]
+WantedBy=graphical.target

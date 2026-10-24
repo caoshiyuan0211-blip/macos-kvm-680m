@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=macOS VM
+Exec=/home/YOUR_USER/macos-kvm-680m/scripts/autostart-vm.sh
+X-KDE-autostart-after=panel

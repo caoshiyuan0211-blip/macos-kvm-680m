@@ -1,0 +1,13 @@
+[Unit]
+Description=Bind Radeon 680M (by ID; 74:00.0 or 73:00.0) to vfio-pci for the macOS VM
+After=systemd-modules-load.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=SUDO_USER=YOUR_USER
+ExecStart=/usr/local/sbin/bind-680m.sh
+
+[Install]
+WantedBy=multi-user.target

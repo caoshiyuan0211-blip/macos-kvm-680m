@@ -1,0 +1,13 @@
+*.o
+*.kext/Contents/MacOS/
+src/RembrandtGfx/RembrandtGfx
+src/RembrandtGfx/fw/
+src/RembrandtGfx/fw.tmp/
+src/RmbGop/*.efi
+src/RmbGop/*.lib
+__pycache__/
+*.bak*
+logs/
+disks/
+roms/
+build/

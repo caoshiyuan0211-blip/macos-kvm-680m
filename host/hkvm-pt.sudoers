@@ -1,0 +1,2 @@
+# hackintosh-kvm: let the VM launcher move USB controllers / Wi-Fi to vfio-pci and back
+YOUR_USER ALL=(root) NOPASSWD: /usr/local/sbin/hkvm-pt.sh
